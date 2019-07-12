@@ -1,0 +1,239 @@
+---
+title: "Radical innovation from a network perspective"
+description: |
+  Exploring radicalness in patent data using network analysis
+author:
+  - name: Robert Kalcik
+    affiliation: AIT Austrian Institute of Technology
+date: "`r Sys.Date()`"
+output: distill::distill_article
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE)
+library(tidyverse)
+library(countrycode)
+library(tidygraph)
+library(igraph)
+library(ggraph)
+
+```
+
+# Load data
+
+Load patent-inventor data and select all patents with at least one inventor within the EU28.
+
+```{r}
+df_inv <- readRDS("../data/regpat_epo_inv.rds")
+
+```
+
+# Geographic distance
+
+## Cooccurence of regions
+
+Explore cooccurence of inventor regions on individual patent applications
+
+```{r}
+cooc <- df_inv %>% 
+  widyr::pairwise_count(reg, appln_id) %>% 
+  rownames_to_column(var = "id")
+cooc %>% arrange(desc(n))
+```
+
+## Distance
+
+Distance between existing region pairs
+
+```{r}
+cent <- readRDS(file = "../data/centroids_EU.rds")
+world <- readRDS(file = "../data/centroids_world.rds")
+
+dist <- cooc %>% select(-n) %>% 
+  gather(key, reg, -id) %>% select(-key) %>% 
+  left_join(cent, by = "reg") %>% 
+  mutate(ctry = str_sub(reg, 1, 2)) %>% 
+  left_join(world, by = "ctry") %>% 
+  mutate(
+    lat = case_when(
+      !is.na(lat.x) ~ lat.x,
+      TRUE ~ lat.y
+    ),
+    lon = case_when(
+      !is.na(lon.x) ~ lon.x,
+      TRUE ~ lon.y
+    )
+  ) %>% 
+  select(id, lon, lat) %>% 
+  filter(!is.na(lat))
+
+dist <- dist %>% 
+  group_by(id) %>% nest() %>% 
+  mutate(dist = map_dbl(data, ~ geosphere::distGeo(.x)[1]))
+
+cooc <- cooc %>% left_join(dist %>% select(-data), by = "id")
+
+```
+
+# Region network 
+
+Compute social proximity between regions. 
+
+```{r}
+g <- graph_from_edgelist(
+    cooc %>% select(item1, item2) %>% as.matrix(), 
+    directed = FALSE
+  ) %>% 
+  as_tbl_graph() %>% 
+  mutate(id = row_number())
+  
+g <- g %>% activate(edges) %>% 
+  distinct()%>% 
+  left_join(as_tibble(g), by = c("from" = "id")) %>% 
+  left_join(as_tibble(g), by = c("to" = "id")) %>% 
+  left_join(cooc, by = c("name.x" = "item1", "name.y" = "item2")) 
+
+g <- g %>% 
+  activate(nodes) %>% 
+  # mutate(central = centrality_alpha(), between = centrality_betweenness())
+  left_join(df_inv %>% count(reg), by = c("name" = "reg"))
+
+saveRDS(g, "data/graph.rds")
+```
+
+## Visualise
+
+```{r}
+# viz ---------------------------------------------------------------------
+nuts <- read_delim("../data/REGPAT/REGPAT_REGIONS.txt", delim = "|")
+  
+g_aut <- g %>% activate(nodes) %>% 
+  filter(str_sub(name, 1, 2) == "AT") %>% 
+  left_join(nuts, by = c("name" = "reg_code"))
+
+g_aut %>%
+  # ggraph(layout = "graphopt") + 
+  # ggraph(layout = 'linear', circular = TRUE) +
+  ggraph() +
+  geom_edge_link(aes(width = n), alpha = 0.2) + 
+  scale_edge_width(range = c(0.2, 2)) +
+  geom_node_point(aes(size = n, colour = Up_reg_label)) +
+  geom_node_text(aes(label = reg_label), repel = TRUE) +
+  labs(edge_width = "# Co-Patents", node_size = "# Total Patents") +
+  theme_graph()
+
+```
+
+# Merge
+
+Aggregate data to the patent level and merge inventor and applicant data
+
+```{r}
+ipc <- readRDS("../data/ipc.RDS")
+radical <- readRDS("../data/radical.RDS")
+
+df_patent <- df_inv %>% 
+  select(appln_id, year_app, reg) %>% 
+  distinct() %>% 
+  group_by(appln_id, year_app) %>% 
+  nest()
+
+df_patent <- df_patent %>% left_join(df_avg_dist, by = c("appln_id"))
+df_patent <- df_patent %>% left_join(as_tibble(g), by = "reg")
+df_patent <- df_patent %>% replace_na(list(avg_dist = 0, d = "Same Region"))
+df_patent <- df_patent %>% left_join(avg_similarity, by = "appln_id")
+
+# anlysis -----------------------------------------------------------------
+df_patent <- df_patent %>% 
+  mutate(
+    avg_dist_sqr = avg_dist ^2,
+    similarity_unity = case_when(is.na(similarity) ~ 1, TRUE ~ similarity)
+  )
+
+saveRDS(df_patent, file = "data/regression_in.rds")
+
+m1 <- lm("radicalness ~ avg_dist + avg_dist_sqr + avg_central + year + factor(tech_field) ", df_patent)
+summary(m1)
+
+m2 <- lm("radicalness ~ factor(d) + avg_central + year + factor(tech_field)", df_patent)
+summary(m2)
+
+m3 <- lm("radicalness ~ avg_dist + avg_dist_sqr + avg_central + similarity + year + factor(tech_field) ", df_patent)
+summary(m3)
+
+m4 <- lm("radicalness ~ factor(d) + avg_central + similarity + year + factor(tech_field)", df_patent)
+summary(m4)
+
+m7 <- lm("radicalness ~ avg_dist + avg_dist_sqr + avg_central + similarity_unity + year + factor(tech_field) ", df_patent)
+summary(m7)
+
+m8 <- lm("radicalness ~ factor(d) + avg_central + similarity_unity + year + factor(tech_field)", df_patent)
+summary(m8)
+
+stargazer::stargazer(m1, m2, m3, m4, m7, m8, type = "html", 
+          dep.var.labels = c(), 
+          covariate.labels = c(), 
+          out="models.htm")
+
+
+# only radical > 0 --------------------------------------------------------
+
+df_patent_filtered <- df_patent %>% filter(radicalness > 0 )
+
+m1 <- lm("radicalness ~ avg_dist + avg_dist_sqr + avg_central + year + factor(tech_field) ", df_patent_filtered)
+summary(m1)
+
+m2 <- lm("radicalness ~ factor(d) + avg_central + year + factor(tech_field)", df_patent_filtered)
+summary(m2)
+
+m3 <- lm("radicalness ~ avg_dist + avg_dist_sqr + avg_central + similarity + year + factor(tech_field) ", df_patent_filtered)
+summary(m3)
+
+m4 <- lm("radicalness ~ factor(d) + avg_central + similarity + year + factor(tech_field)", df_patent_filtered)
+summary(m4)
+
+m7 <- lm("radicalness ~ avg_dist + avg_dist_sqr + avg_central + similarity_unity + year + factor(tech_field) ", df_patent_filtered)
+summary(m7)
+
+m8 <- lm("radicalness ~ factor(d) + avg_central + similarity_unity + year + factor(tech_field)", df_patent_filtered)
+summary(m8)
+
+stargazer::stargazer(m1, m2, m3, m4, m7, m8, type = "html", 
+                     dep.var.labels = c(), 
+                     covariate.labels = c(), 
+                     out = "models_intensive.htm")
+
+# merge with full data ----------------------------------------------------
+person_reg <- df %>% select(reg, person_id, year)
+reg_edges <- df %>% select(appln_id, reg) %>% distinct()
+reg_edges <- full_join(reg_edges, reg_edges, by = "appln_id")
+
+
+# node similarity ---------------------------------------------------------
+# similarity <- df %>% select(appln_id, reg) %>% 
+#   count(appln_id, reg) %>% 
+#   widyr::pairwise_delta(appln_id, reg, n, method = "burrows")
+
+s <- reg_edges %>% count(reg.x, reg.y) %>% 
+  filter(reg.x != reg.y) %>% 
+  group_by(reg.x) %>% mutate(total.x = sum(n, na.rm = TRUE)) %>% ungroup() %>% 
+  group_by(reg.y) %>% mutate(total.y = sum(n, na.rm = TRUE)) %>% ungroup() %>% 
+  mutate(similarity = n /(total.x + total.y))
+
+avg_similarity <- reg_edges %>% left_join(s, by = c("reg.x", "reg.y"))
+avg_similarity <- avg_similarity %>% group_by(appln_id) %>% summarise(similarity = mean(similarity, na.rm = TRUE))
+
+
+# g %>% activate(node) %>% 
+#   mutate(similarity = node_similarity_with())
+
+reg_edges %>% count(reg.x, reg.y)
+  widyr::pairwise_delta()
+```
+
+
+
+
+
+
+
